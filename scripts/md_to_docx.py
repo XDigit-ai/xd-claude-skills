@@ -434,14 +434,17 @@ class MarkdownToDocx:
                     max_len = max(max_len, len(text))
             col_lengths.append(max(max_len, 4))
         total_chars = sum(col_lengths)
-        min_col = max(900, PAGE_WIDTH // (num_cols * 3))  # floor: ~1/3 of equal share
-        col_widths = []
-        remaining_w = PAGE_WIDTH
-        for length in col_lengths[:-1]:
-            cw = max(int(PAGE_WIDTH * length / total_chars), min_col)
-            col_widths.append(cw)
-            remaining_w -= cw
-        col_widths.append(max(remaining_w, min_col))
+        min_col = max(900, PAGE_WIDTH // (num_cols * 4))
+        if num_cols > 1:
+            # First column: proportional to content, capped at 50% of page
+            first_w = max(min(int(PAGE_WIDTH * col_lengths[0] / total_chars), PAGE_WIDTH // 2), min_col)
+            # Remaining columns: divide leftover equally so short-value columns get decent space
+            rest_w = PAGE_WIDTH - first_w
+            equal_w = rest_w // (num_cols - 1)
+            col_widths = [first_w] + [equal_w] * (num_cols - 1)
+            col_widths[-1] = PAGE_WIDTH - sum(col_widths[:-1])  # absorb rounding
+        else:
+            col_widths = [PAGE_WIDTH]
 
         tbl = ET.Element(f'{w}tbl')
         tblPr = ET.SubElement(tbl, f'{w}tblPr')
