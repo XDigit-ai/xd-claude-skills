@@ -339,7 +339,67 @@ class MarkdownToDocx:
         return p
 
     # ------------------------------------------------------------------ #
-    # Table creation (v2 improved)                                         #
+    # Table cell helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _add_table_run(self, parent: ET.Element, text: str,
+                       is_header=False, bold=False, italic=False):
+        w = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        run = ET.SubElement(parent, f'{w}r')
+        rPr = ET.SubElement(run, f'{w}rPr')
+        rFonts = ET.SubElement(rPr, f'{w}rFonts')
+        rFonts.set(f'{w}ascii', 'Causten')
+        rFonts.set(f'{w}hAnsi', 'Causten')
+        sz = ET.SubElement(rPr, f'{w}sz')
+        sz.set(f'{w}val', '20')
+        szCs = ET.SubElement(rPr, f'{w}szCs')
+        szCs.set(f'{w}val', '20')
+        if bold or is_header:
+            ET.SubElement(rPr, f'{w}b')
+        if italic:
+            ET.SubElement(rPr, f'{w}i')
+        if is_header:
+            clr = ET.SubElement(rPr, f'{w}color')
+            clr.set(f'{w}val', 'FFFFFF')
+        t = ET.SubElement(run, f'{w}t')
+        t.text = text
+        if text.startswith(' ') or text.endswith(' '):
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+
+    def _create_table_cell_runs(self, text: str, parent: ET.Element, is_header=False):
+        """Parse inline bold/italic in table cells and create formatted runs."""
+        patterns = [
+            (r'\*\*\*(.+?)\*\*\*', 'bold_italic'),
+            (r'\*\*(.+?)\*\*',     'bold'),
+            (r'__(.+?)__',         'bold'),
+            (r'\*(.+?)\*',         'italic'),
+            (r'_(.+?)_',           'italic'),
+        ]
+        remaining = text
+        while remaining:
+            earliest_match = None
+            earliest_pos = len(remaining)
+            match_type = None
+            for pattern, fmt_type in patterns:
+                m = re.search(pattern, remaining)
+                if m and m.start() < earliest_pos:
+                    earliest_match = m
+                    earliest_pos = m.start()
+                    match_type = fmt_type
+            if earliest_match:
+                if earliest_pos > 0:
+                    self._add_table_run(parent, remaining[:earliest_pos], is_header=is_header)
+                bold = match_type in ('bold', 'bold_italic')
+                italic = match_type in ('italic', 'bold_italic')
+                self._add_table_run(parent, earliest_match.group(1),
+                                    is_header=is_header, bold=bold, italic=italic)
+                remaining = remaining[earliest_match.end():]
+            else:
+                self._add_table_run(parent, remaining, is_header=is_header)
+                break
+
+    # ------------------------------------------------------------------ #
+    # Table creation                                                       #
     # ------------------------------------------------------------------ #
 
     def _create_table(self, table_data: dict) -> ET.Element:
@@ -348,6 +408,7 @@ class MarkdownToDocx:
         ALT_ROW_BG   = 'EEF0FD'
         BORDER_COLOR = 'D0D0D0'
         BORDER_SZ    = '4'
+        PAGE_WIDTH   = 9070  # twips — A4 with 25mm margins each side
 
         def make_border(tag):
             el = ET.Element(f'{w}{tag}')
@@ -357,25 +418,46 @@ class MarkdownToDocx:
             el.set(f'{w}color', BORDER_COLOR)
             return el
 
+        header    = table_data.get('header') or []
+        data_rows = table_data.get('rows')   or []
+        all_rows  = ([header] if header else []) + data_rows
+        num_cols  = max((len(r) for r in all_rows), default=1)
+
+        # Proportional column widths based on max content length per column
+        col_lengths = []
+        for col_idx in range(num_cols):
+            max_len = 0
+            for row in all_rows:
+                if col_idx < len(row):
+                    # Strip markdown markers before measuring
+                    text = re.sub(r'\*+', '', row[col_idx])
+                    max_len = max(max_len, len(text))
+            col_lengths.append(max(max_len, 4))
+        total_chars = sum(col_lengths)
+        min_col = max(900, PAGE_WIDTH // (num_cols * 3))  # floor: ~1/3 of equal share
+        col_widths = []
+        remaining_w = PAGE_WIDTH
+        for length in col_lengths[:-1]:
+            cw = max(int(PAGE_WIDTH * length / total_chars), min_col)
+            col_widths.append(cw)
+            remaining_w -= cw
+        col_widths.append(max(remaining_w, min_col))
+
         tbl = ET.Element(f'{w}tbl')
         tblPr = ET.SubElement(tbl, f'{w}tblPr')
         tblW = ET.SubElement(tblPr, f'{w}tblW')
-        tblW.set(f'{w}w', '0')
-        tblW.set(f'{w}type', 'auto')
+        tblW.set(f'{w}w', str(PAGE_WIDTH))
+        tblW.set(f'{w}type', 'dxa')
         tblBorders = ET.SubElement(tblPr, f'{w}tblBorders')
         for side in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
             tblBorders.append(make_border(side))
         tblLook = ET.SubElement(tblPr, f'{w}tblLook')
         tblLook.set(f'{w}val', '04A0')
 
-        header    = table_data.get('header') or []
-        data_rows = table_data.get('rows')   or []
-        all_rows  = ([header] if header else []) + data_rows
-        num_cols  = max((len(r) for r in all_rows), default=1)
-
         tblGrid = ET.SubElement(tbl, f'{w}tblGrid')
-        for _ in range(num_cols):
-            ET.SubElement(tblGrid, f'{w}gridCol')
+        for cw in col_widths:
+            gc = ET.SubElement(tblGrid, f'{w}gridCol')
+            gc.set(f'{w}w', str(cw))
 
         def add_row(cells, is_header=False, row_index=0):
             tr = ET.SubElement(tbl, f'{w}tr')
@@ -387,6 +469,9 @@ class MarkdownToDocx:
             for col_idx in range(num_cols):
                 tc = ET.SubElement(tr, f'{w}tc')
                 tcPr = ET.SubElement(tc, f'{w}tcPr')
+                tcW_el = ET.SubElement(tcPr, f'{w}tcW')
+                tcW_el.set(f'{w}w', str(col_widths[col_idx]))
+                tcW_el.set(f'{w}type', 'dxa')
                 if row_bg:
                     shd = ET.SubElement(tcPr, f'{w}shd')
                     shd.set(f'{w}val',   'clear')
@@ -404,24 +489,8 @@ class MarkdownToDocx:
                 spacing = ET.SubElement(pPr, f'{w}spacing')
                 spacing.set(f'{w}before', '40')
                 spacing.set(f'{w}after',  '40')
-                run = ET.SubElement(p, f'{w}r')
-                rPr = ET.SubElement(run, f'{w}rPr')
-                rFonts = ET.SubElement(rPr, f'{w}rFonts')
-                rFonts.set(f'{w}ascii', 'Causten')
-                rFonts.set(f'{w}hAnsi', 'Causten')
-                sz = ET.SubElement(rPr, f'{w}sz')
-                sz.set(f'{w}val', '20')
-                szCs = ET.SubElement(rPr, f'{w}szCs')
-                szCs.set(f'{w}val', '20')
-                if is_header:
-                    ET.SubElement(rPr, f'{w}b')
-                    clr = ET.SubElement(rPr, f'{w}color')
-                    clr.set(f'{w}val', 'FFFFFF')
                 cell_text = cells[col_idx] if col_idx < len(cells) else ''
-                t = ET.SubElement(run, f'{w}t')
-                t.text = cell_text
-                if cell_text.startswith(' ') or cell_text.endswith(' '):
-                    t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                self._create_table_cell_runs(cell_text, p, is_header=is_header)
 
         if header:
             add_row(header, is_header=True)
@@ -778,7 +847,18 @@ class MarkdownToDocx:
                 new_content = f.read()
             new_doc_tag_match = re.search(r'<w:document[^>]+>', new_content)
             if new_doc_tag_match:
-                new_content = new_content.replace(new_doc_tag_match.group(0), original_doc_tag, 1)
+                new_tag = new_doc_tag_match.group(0)
+                # Merge any namespace declarations added by ET (e.g. xmlns:a, xmlns:pic for images)
+                # that are not present in the original template tag
+                new_ns = dict(re.findall(r'xmlns:(\w+)="([^"]*)"', new_tag))
+                orig_ns = dict(re.findall(r'xmlns:(\w+)="([^"]*)"', original_doc_tag))
+                missing = {k: v for k, v in new_ns.items() if k not in orig_ns}
+                if missing:
+                    extra = ' '.join(f'xmlns:{k}="{v}"' for k, v in missing.items())
+                    merged_tag = original_doc_tag[:-1] + ' ' + extra + '>'
+                else:
+                    merged_tag = original_doc_tag
+                new_content = new_content.replace(new_tag, merged_tag, 1)
                 with open(doc_path, 'w', encoding='utf-8') as f:
                     f.write(new_content)
 
